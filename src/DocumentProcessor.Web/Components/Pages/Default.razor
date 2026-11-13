@@ -1,0 +1,417 @@
+@page "/"
+@page "/Default"
+@page "/Default.aspx"
+@rendermode InteractiveServer
+@using global::System.IO
+@using global::Microsoft.EntityFrameworkCore
+@using global::Microsoft.Extensions.DependencyInjection
+@using global::Microsoft.Extensions.Logging
+@using DocumentProcessor.Web.Data
+@using DocumentProcessor.Web.Models
+@using DocumentProcessor.Web.Services
+@implements IDisposable
+@inject IServiceScopeFactory ScopeFactory
+@inject ILogger<Default> Logger
+
+<PageTitle>Document Processor</PageTitle>
+
+<div class="app-grid">
+    <section>
+        @* Uploading streams the picked files over the circuit; the page stays responsive while
+           each document is stored and summarized. *@
+        <DocumentUploader @ref="Uploader"
+                          IdPrefix="ctl00_MainContent_Uploader"
+                          NamePrefix="ctl00$MainContent$Uploader"
+                          UploadRequested="Uploader_UploadRequested" />
+    </section>
+
+    <section>
+        @* The legacy partial-update panel rendered this wrapper div; Blazor re-renders the region on state change. *@
+        <div id="ctl00_MainContent_ListPanel">
+            <DocumentList IdPrefix="ctl00_MainContent_Documents"
+                          NamePrefix="ctl00$MainContent$Documents"
+                          Documents="documents"
+                          RefreshRequested="Documents_RefreshRequested"
+                          ViewSummaryRequested="Documents_ViewSummaryRequested"
+                          DeleteRequested="Documents_DeleteRequested" />
+
+            @if (summaryModalVisible)
+            {
+                <div id="ctl00_MainContent_SummaryModal" class="modal fade show d-block modal-backdrop-tint" tabindex="-1">
+                    <div class="modal-dialog">
+                        <div class="modal-content">
+                            <div class="modal-header">
+                                <h6 class="modal-title">@summaryModalTitle</h6>
+                                <a href="#" id="ctl00_MainContent_SummaryModalDismiss" class="btn-close"
+                                   @onclick="CloseSummaryModal_Click" @onclick:preventDefault></a>
+                            </div>
+                            <div class="modal-body">
+                                <p>@summaryModalBody</p>
+                            </div>
+                            <div class="modal-footer">
+                                <a href="#" id="ctl00_MainContent_SummaryModalClose" class="btn btn-sm btn-secondary"
+                                   @onclick="CloseSummaryModal_Click" @onclick:preventDefault>Close</a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            }
+
+            @if (deleteModalVisible)
+            {
+                <div id="ctl00_MainContent_DeleteModal" class="modal fade show d-block modal-backdrop-tint" tabindex="-1">
+                    <div class="modal-dialog modal-sm">
+                        <div class="modal-content">
+                            <div class="modal-header">
+                                <h6 class="modal-title">Delete document?</h6>
+                                <a href="#" id="ctl00_MainContent_DeleteModalDismiss" class="btn-close"
+                                   @onclick="CancelDelete_Click" @onclick:preventDefault></a>
+                            </div>
+                            <div class="modal-body">
+                                <p class="mb-0"><strong>@deleteModalFileName</strong></p>
+                            </div>
+                            <div class="modal-footer">
+                                <a href="#" id="ctl00_MainContent_CancelDeleteButton" class="btn btn-sm btn-secondary"
+                                   @onclick="CancelDelete_Click" @onclick:preventDefault>Cancel</a>
+                                <a href="#" id="ctl00_MainContent_ConfirmDeleteButton" class="btn btn-sm btn-danger"
+                                   @onclick="ConfirmDelete_Click" @onclick:preventDefault>Delete</a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            }
+        </div>
+
+        @* The legacy UpdateProgress: shown once a list action has been running for 300 ms. *@
+        <div id="ctl00_MainContent_ListProgress" role="status" aria-hidden="@(listProgressVisible ? "false" : "true")"
+             style="@(listProgressVisible ? "display:block;" : "display:none;")">
+            <div class="update-progress"><span class="spinner-border"></span></div>
+        </div>
+    </section>
+</div>
+
+@code {
+    private const int MaxDocumentsShown = 50;
+    private const int ListProgressDisplayAfterMilliseconds = 300;
+
+    private DocumentUploader Uploader;
+
+    private IList<Document> documents = new List<Document>();
+
+    private bool summaryModalVisible;
+    private string summaryModalTitle;
+    private string summaryModalBody;
+
+    private bool deleteModalVisible;
+    private string deleteModalFileName;
+
+    // The id of the document awaiting delete confirmation (formerly kept in view state).
+    private Guid? deleteTargetId;
+
+    private bool listProgressVisible;
+    private int listBusyCount;
+    private CancellationTokenSource listProgressDelay;
+
+    // Messages raised before the uploader component exists (the first load runs before the
+    // first render); shown as soon as it has rendered.
+    private readonly List<Notification> pendingNotifications = new List<Notification>();
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadDocumentsAsync();
+    }
+
+    protected override void OnAfterRender(bool firstRender)
+    {
+        if (Uploader != null && pendingNotifications.Count > 0)
+        {
+            var queued = pendingNotifications.ToList();
+            pendingNotifications.Clear();
+
+            foreach (var notification in queued)
+            {
+                Uploader.Notify(notification.Text, notification.Level);
+            }
+        }
+    }
+
+    private async Task Uploader_UploadRequested(UploadEventArgs e)
+    {
+        foreach (var file in e.Files)
+        {
+            var name = Path.GetFileName(file.Name);
+
+            try
+            {
+                using var scope = ScopeFactory.CreateScope();
+                var storage = scope.ServiceProvider.GetRequiredService<IDocumentStorage>();
+                var pipeline = scope.ServiceProvider.GetRequiredService<DocumentPipeline>();
+                var db = scope.ServiceProvider.GetRequiredService<DocumentDbContext>();
+
+                var document = await StoreAsync(storage, db, e, file, name);
+
+                await pipeline.ProcessAsync(document.Id);
+
+                Notify(string.Format("'{0}' processed", name), NotificationLevel.Success);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Upload failed for {FileName}.", name);
+                Notify(string.Format("'{0}' failed to upload", name), NotificationLevel.Danger);
+            }
+
+            // Show each result as it arrives instead of waiting for the whole batch.
+            StateHasChanged();
+        }
+
+        await LoadDocumentsAsync();
+    }
+
+    private Task Documents_RefreshRequested()
+    {
+        return RunListActionAsync(LoadDocumentsAsync);
+    }
+
+    private Task Documents_ViewSummaryRequested(DocumentEventArgs e)
+    {
+        return RunListActionAsync(async () =>
+        {
+            var document = await FindAsync(e.DocumentId);
+
+            if (document == null)
+            {
+                Notify("That document is no longer available.", NotificationLevel.Warning);
+                await LoadDocumentsAsync();
+                return;
+            }
+
+            // Razor encodes @ output, so Server.HtmlEncode is no longer needed.
+            summaryModalTitle = document.OriginalFileName;
+            summaryModalBody = document.Summary ?? string.Empty;
+            summaryModalVisible = true;
+        });
+    }
+
+    private void CloseSummaryModal_Click()
+    {
+        ClearNotifications();
+        summaryModalVisible = false;
+    }
+
+    private Task Documents_DeleteRequested(DocumentEventArgs e)
+    {
+        return RunListActionAsync(async () =>
+        {
+            var document = await FindAsync(e.DocumentId);
+
+            if (document == null)
+            {
+                Notify("That document is no longer available.", NotificationLevel.Warning);
+                await LoadDocumentsAsync();
+                return;
+            }
+
+            deleteTargetId = document.Id;
+            deleteModalFileName = document.OriginalFileName;
+            deleteModalVisible = true;
+        });
+    }
+
+    private void CancelDelete_Click()
+    {
+        ClearNotifications();
+        deleteTargetId = null;
+        deleteModalVisible = false;
+    }
+
+    private Task ConfirmDelete_Click()
+    {
+        return RunListActionAsync(async () =>
+        {
+            if (deleteTargetId is not Guid documentId)
+            {
+                deleteModalVisible = false;
+                return;
+            }
+
+            try
+            {
+                // Soft delete: the row stays, flagged IsDeleted.
+                using (var scope = ScopeFactory.CreateScope())
+                {
+                    var db = scope.ServiceProvider.GetRequiredService<DocumentDbContext>();
+                    var document = await db.Documents.FirstOrDefaultAsync(d => d.Id == documentId && !d.IsDeleted);
+
+                    if (document != null)
+                    {
+                        document.IsDeleted = true;
+                        await db.SaveChangesAsync();
+                    }
+                }
+
+                deleteTargetId = null;
+                deleteModalVisible = false;
+                await LoadDocumentsAsync();
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Delete failed for document {DocumentId}.", documentId);
+                Notify("Could not delete the document.", NotificationLevel.Danger);
+            }
+        });
+    }
+
+    private async Task LoadDocumentsAsync()
+    {
+        try
+        {
+            using var scope = ScopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<DocumentDbContext>();
+
+            documents = await db.Documents
+                .AsNoTracking()
+                .Where(d => !d.IsDeleted)
+                .OrderByDescending(d => d.UploadedAt)
+                .Take(MaxDocumentsShown)
+                .ToListAsync();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Could not load documents.");
+            documents = new List<Document>();
+            Notify("Could not load documents.", NotificationLevel.Danger);
+        }
+    }
+
+    private async Task<Document> FindAsync(Guid documentId)
+    {
+        using var scope = ScopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<DocumentDbContext>();
+
+        return await db.Documents
+            .AsNoTracking()
+            .FirstOrDefaultAsync(d => d.Id == documentId && !d.IsDeleted);
+    }
+
+    private static async Task<Document> StoreAsync(
+        IDocumentStorage storage,
+        DocumentDbContext db,
+        UploadEventArgs e,
+        IBrowserFile file,
+        string name)
+    {
+        var document = new Document
+        {
+            FileName = name,
+            OriginalFileName = name,
+            FileExtension = Path.GetExtension(name).ToLowerInvariant(),
+            ContentType = file.ContentType,
+            FileSize = file.Size,
+            UploadedAt = DateTimeOffset.UtcNow,
+            Status = DocumentStatus.Pending
+        };
+
+        // The browser stream only supports asynchronous reads, and IDocumentStorage.Save copies
+        // synchronously, so the upload is buffered first. OpenReadStream is capped at
+        // Storage.MaxFileSizeMegabytes in bytes (UploadEventArgs.MaxAllowedSize).
+        using (var buffer = new MemoryStream())
+        {
+            await using (var upload = e.OpenReadStream(file))
+            {
+                await upload.CopyToAsync(buffer);
+            }
+
+            buffer.Position = 0;
+            document.StoragePath = storage.Save(buffer, name);
+        }
+
+        db.Documents.Add(document);
+        await db.SaveChangesAsync();
+
+        return document;
+    }
+
+    /// <summary>
+    /// Runs an action that the legacy page performed as a partial (asynchronous) postback:
+    /// messages from the previous action are cleared (they lasted one request) and the
+    /// progress indicator appears once the action has run for 300 ms.
+    /// </summary>
+    private async Task RunListActionAsync(Func<Task> action)
+    {
+        ClearNotifications();
+
+        listBusyCount++;
+        if (listBusyCount == 1)
+        {
+            StartListProgressTimer();
+        }
+
+        try
+        {
+            await action();
+        }
+        finally
+        {
+            listBusyCount--;
+            if (listBusyCount == 0)
+            {
+                StopListProgressTimer();
+            }
+        }
+    }
+
+    private void StartListProgressTimer()
+    {
+        listProgressDelay?.Cancel();
+        listProgressDelay?.Dispose();
+        listProgressDelay = new CancellationTokenSource();
+        var token = listProgressDelay.Token;
+
+        _ = InvokeAsync(async () =>
+        {
+            try
+            {
+                await Task.Delay(ListProgressDisplayAfterMilliseconds, token);
+            }
+            catch (TaskCanceledException)
+            {
+                return;
+            }
+
+            if (!token.IsCancellationRequested && listBusyCount > 0)
+            {
+                listProgressVisible = true;
+                StateHasChanged();
+            }
+        });
+    }
+
+    private void StopListProgressTimer()
+    {
+        listProgressDelay?.Cancel();
+        listProgressVisible = false;
+    }
+
+    private void Notify(string text, NotificationLevel level)
+    {
+        if (Uploader == null)
+        {
+            pendingNotifications.Add(new Notification(text, level));
+            return;
+        }
+
+        Uploader.Notify(text, level);
+    }
+
+    private void ClearNotifications()
+    {
+        pendingNotifications.Clear();
+        Uploader?.ClearNotifications();
+    }
+
+    public void Dispose()
+    {
+        listProgressDelay?.Cancel();
+        listProgressDelay?.Dispose();
+    }
+}

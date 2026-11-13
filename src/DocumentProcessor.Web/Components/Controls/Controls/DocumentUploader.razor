@@ -1,0 +1,246 @@
+@using global::System.Globalization
+@using global::System.IO
+@using DocumentProcessor.Web.Configuration
+@using DocumentProcessor.Web.Models
+@using DocumentProcessor.Web.Services
+@using global::Microsoft.Extensions.Options
+@inject IOptions<StorageOptions> StorageSettings
+
+<h1 class="upload-title">Upload a document and I'll summarize it.</h1>
+<p class="upload-subtitle">
+    @fileTypeSummaryText
+    &middot; up to @maxFileSizeText MB
+</p>
+
+<div class="dropzone">
+    @* The file input is stretched over the whole zone by .dropzone-input, which is what
+       makes dropping files onto it work without any script. *@
+    <InputFile @key="pickerKey" OnChange="FilePicker_Change" multiple
+               id="@(IdPrefix + "_FilePicker")" name="@(NamePrefix + "$FilePicker")"
+               class="dropzone-input" title="Drag files here or click to browse" />
+    <div class="dropzone-icon"><i class="bi bi-cloud-arrow-up"></i></div>
+    <p class="dropzone-hint">Drag files here</p>
+    <span class="btn-brand">Browse files</span>
+</div>
+
+@* Filled in from the InputFile selection: the component knows the picked files as soon as
+   the browser reports them, so no script is needed to list them. *@
+<ul id="selectedList" class="selected-list">
+    @foreach (var file in pickedFiles)
+    {
+        <li class="selected-item"><small>@(file.Name + " (" + FormatSize(file.Size) + ")")</small></li>
+    }
+</ul>
+
+<div id="uploadActions" class="d-flex gap-2 mt-3" style="@(pickedFiles.Count > 0 ? null : "display: none;")">
+    @* Kept as a link (the Web Forms LinkButton) so the busy state can show a spinner inside it;
+       a second click while busy is ignored by the handler. *@
+    <a href="#" id="@(IdPrefix)_UploadButton" class="@(submitting ? "btn-brand is-busy" : "btn-brand")"
+       @onclick="UploadButton_Click" @onclick:preventDefault>
+        <span id="uploadIdleLabel" style="@(submitting ? "display: none;" : null)">@IdleLabelText</span>
+        <span id="uploadBusyLabel" style="@(submitting ? null : "display: none;")">
+            <span class="spinner-border spinner-border-sm me-1"></span>Uploading...
+        </span>
+    </a>
+    <button type="button" id="clearButton" class="btn-quiet" disabled="@submitting" @onclick="ClearButton_Click">Clear</button>
+</div>
+
+@* Summarizing can take a while. Say so. *@
+<p id="uploadStatus" class="upload-status" style="@(string.IsNullOrEmpty(statusText) ? "display: none;" : null)">@statusText</p>
+
+@foreach (var notice in notifications)
+{
+    <div class="notice notice-@notice.CssSuffix">
+        <i class="bi @notice.IconClass"></i>
+        <span>@notice.Text</span>
+    </div>
+}
+
+@code {
+    private readonly List<Notification> notifications = new List<Notification>();
+    private List<IBrowserFile> pickedFiles = new List<IBrowserFile>();
+    private int pickedCount;
+    private int pickerKey;
+    private bool submitting;
+    private string statusText;
+    private string fileTypeSummaryText;
+    private string maxFileSizeText;
+
+    /// <summary>Client id of this control instance (Web Forms naming container), e.g. MainContent_Uploader.</summary>
+    [Parameter] public string IdPrefix { get; set; } = "MainContent_Uploader";
+
+    /// <summary>UniqueID of this control instance, e.g. ctl00$MainContent$Uploader.</summary>
+    [Parameter] public string NamePrefix { get; set; } = "ctl00$MainContent$Uploader";
+
+    /// <summary>
+    /// Raised once the picked files have passed size and extension checks. The page
+    /// stores them and runs the pipeline; this control only deals with the form.
+    /// </summary>
+    [Parameter] public EventCallback<UploadEventArgs> UploadRequested { get; set; }
+
+    private StorageOptions Storage => StorageSettings.Value;
+
+    private long MaxFileSizeBytes => Storage.MaxFileSizeMegabytes * 1024L * 1024L;
+
+    private string IdleLabelText
+    {
+        get
+        {
+            if (pickedCount == 0)
+            {
+                return "Upload";
+            }
+
+            return pickedCount == 1 ? "Upload 1 file" : "Upload " + pickedCount + " files";
+        }
+    }
+
+    protected override void OnInitialized()
+    {
+        var extensions = (Storage.AllowedExtensions ?? Array.Empty<string>())
+            .Select(extension => extension.TrimStart('.').ToUpperInvariant());
+
+        fileTypeSummaryText = string.Join(", ", extensions);
+        maxFileSizeText = Storage.MaxFileSizeMegabytes.ToString(CultureInfo.CurrentCulture);
+    }
+
+    /// <summary>Adds a message shown under the dropzone.</summary>
+    public void Notify(string text, NotificationLevel level)
+    {
+        notifications.Add(new Notification(text, level));
+        StateHasChanged();
+    }
+
+    /// <summary>
+    /// Removes the messages shown under the dropzone. In Web Forms they lasted for one
+    /// request; the page calls this when it starts a new action.
+    /// </summary>
+    public void ClearNotifications()
+    {
+        notifications.Clear();
+        StateHasChanged();
+    }
+
+    private void FilePicker_Change(InputFileChangeEventArgs e)
+    {
+        var maxFiles = Storage.MaxFilesPerUpload;
+        pickedCount = e.FileCount;
+
+        // GetMultipleFiles throws when the selection exceeds maximumFileCount. The legacy control
+        // kept the first MaxFilesPerUpload files and warned on upload, so an oversized selection
+        // is read in full here and trimmed in UploadButton_Click.
+        pickedFiles = e.FileCount > maxFiles
+            ? e.GetMultipleFiles(maximumFileCount: e.FileCount).ToList()
+            : e.GetMultipleFiles(maximumFileCount: maxFiles).ToList();
+    }
+
+    private void ClearButton_Click()
+    {
+        ResetPicker();
+    }
+
+    private void ResetPicker()
+    {
+        pickedFiles = new List<IBrowserFile>();
+        pickedCount = 0;
+        // A new key re-creates the <input type="file">, which is the only way to empty it.
+        pickerKey++;
+    }
+
+    private async Task UploadButton_Click()
+    {
+        if (submitting)
+        {
+            return;
+        }
+
+        notifications.Clear();
+
+        var accepted = new List<IBrowserFile>();
+        var maxFiles = Storage.MaxFilesPerUpload;
+        var maxBytes = MaxFileSizeBytes;
+        var allowed = Storage.AllowedExtensions ?? Array.Empty<string>();
+
+        var posted = pickedFiles
+            .Where(file => file != null && !string.IsNullOrEmpty(file.Name))
+            .ToList();
+
+        if (posted.Count == 0)
+        {
+            Notify("Choose at least one file to upload.", NotificationLevel.Warning);
+            return;
+        }
+
+        if (posted.Count > maxFiles)
+        {
+            Notify(
+                string.Format("Only the first {0} files were taken from this upload.", maxFiles),
+                NotificationLevel.Warning);
+
+            posted = posted.Take(maxFiles).ToList();
+        }
+
+        foreach (var file in posted)
+        {
+            var name = Path.GetFileName(file.Name);
+
+            if (file.Size > maxBytes)
+            {
+                Notify(
+                    string.Format("'{0}' exceeds {1} MB", name, Storage.MaxFileSizeMegabytes),
+                    NotificationLevel.Warning);
+                continue;
+            }
+
+            var extension = Path.GetExtension(name).ToLowerInvariant();
+
+            if (!allowed.Contains(extension) || !DocumentTextExtractor.CanExtract(extension))
+            {
+                Notify(
+                    string.Format("'{0}' is not a supported file type", name),
+                    NotificationLevel.Warning);
+                continue;
+            }
+
+            accepted.Add(file);
+        }
+
+        if (accepted.Count > 0 && UploadRequested.HasDelegate)
+        {
+            var count = pickedCount;
+            submitting = true;
+            statusText = "Uploading " + count + (count == 1 ? " file" : " files")
+                + ". Each document is summarized before the page comes back, so this can take"
+                + " a while. Leaving the page cancels it.";
+            StateHasChanged();
+
+            try
+            {
+                await UploadRequested.InvokeAsync(new UploadEventArgs(accepted, maxBytes));
+            }
+            finally
+            {
+                // The Web Forms postback replaced the page, which cleared the busy state and
+                // the file input; do the same once the page has processed the files.
+                submitting = false;
+                statusText = null;
+                ResetPicker();
+            }
+        }
+    }
+
+    private static string FormatSize(long bytes)
+    {
+        var units = new[] { "B", "KB", "MB", "GB" };
+        double size = bytes;
+        var unit = 0;
+        while (size >= 1024 && unit < units.Length - 1)
+        {
+            size = size / 1024;
+            unit++;
+        }
+
+        var rounded = Math.Round(size * 100, MidpointRounding.AwayFromZero) / 100;
+        return rounded.ToString(CultureInfo.InvariantCulture) + " " + units[unit];
+    }
+}
